@@ -14,6 +14,9 @@ are no API tokens to manage in this tool — it uses whatever `gh auth login` se
 - **Change visibility** (public ↔ private) in bulk.
 - **Set descriptions** — optionally scan READMEs and auto-suggest a description
   for repos that don't have one.
+- **Audit & manage committed `.env` files** — optionally flag repos with a root
+  `.env`, export its contents, and **update or delete** that file (to clean up or
+  rotate leaked secrets).
 - **Delete** repos, with multiple safety guards.
 - **Preview by default** — nothing changes on GitHub until you pass `--yes`.
 - Drift detection, archived-repo handling, and a per-run log.
@@ -25,7 +28,7 @@ are no API tokens to manage in this tool — it uses whatever `gh auth login` se
 | **Python 3.8+** | runs the script | `python --version` |
 | **`openpyxl`** | reads/writes the Excel file | `pip install -r requirements.txt` |
 | **GitHub CLI (`gh`)** | performs every GitHub operation | [cli.github.com](https://cli.github.com/), then `gh auth login` |
-| **`repo` token scope** | list repos, change visibility, read READMEs, set descriptions | included by default with `gh auth login` |
+| **`repo` token scope** | list repos, change visibility, read READMEs, set descriptions, read/update/delete `.env` | included by default with `gh auth login` |
 | **`delete_repo` token scope** | **required for the `delete` action only** | not default — see below |
 
 ### One-time setup
@@ -38,9 +41,9 @@ pip install -r requirements.txt    # install openpyxl
 ### ⚠️ Deletion requires the `delete_repo` scope
 
 `gh auth login` grants the `repo` scope, which is enough to **export**, **change
-visibility**, and **set descriptions**. Deleting a repo needs the **extra**
-`delete_repo` scope — without it, `apply --yes` fails on `delete` rows (other
-changes still succeed).
+visibility**, **set descriptions**, and **read/update/delete `.env`**. Deleting a
+repo needs the **extra** `delete_repo` scope — without it, `apply --yes` fails on
+`delete` rows (other changes still succeed).
 
 Check your scopes, then add it if missing:
 ```
@@ -48,8 +51,8 @@ gh auth status                     # look at the 'Token scopes:' line
 gh auth refresh -s delete_repo     # add the delete scope
 ```
 
-> The README scan and description updates need **nothing extra** beyond the
-> `repo` scope above — no additional scope and no additional Python package.
+> README/`.env` reads, description updates, and `.env` writes/deletes all work with
+> the `repo` scope above — no additional token scope and no additional Python package.
 
 ## Quick start
 
@@ -65,12 +68,13 @@ python repo_manager.py apply repos.xlsx --yes   # 4. apply them
 ### Export
 
 ```
-python repo_manager.py export [repos.xlsx] [--owner NAME] [--descriptions]
+python repo_manager.py export [repos.xlsx] [--owner NAME] [--descriptions] [--check-env]
 ```
 
 Creates the spreadsheet with one row per repo. The grey **identity columns**
 (Owner, Repo, URL, Current Visibility, Has README, Current Description, Archived,
-Fork, Created, Last Push, Size) are read-only. You edit four columns:
+Fork, Created, Last Push, Size, Has .env, .env Content) are read-only. You edit
+these columns:
 
 | Column             | Choices              | Meaning                                             |
 |--------------------|----------------------|-----------------------------------------------------|
@@ -78,6 +82,8 @@ Fork, Created, Last Push, Size) are read-only. You edit four columns:
 | `Action`           | `keep` / `delete`    | Set to `delete` to remove the repo.                 |
 | `New Description`  | free text            | The text applied when `Set Description?` is `set`.  |
 | `Set Description?` | `keep` / `set`       | Set to `set` to update the repo's About field.      |
+| `New .env Content` | free text            | The contents written when `.env Action` is `update` (pre-filled from the current `.env`). |
+| `.env Action`      | `keep` / `update` / `delete` | `update` commits New .env Content to the repo's `.env`; `delete` removes the file. |
 
 Options:
 - `--owner NAME` — export a different account/org instead of your own.
@@ -85,6 +91,15 @@ Options:
   **New Description** with a short summary for repos that have a README but no
   description yet. Makes one request per repo (slower); without it those columns
   show `not scanned`.
+- `--check-env` — check each repo for a committed root **`.env`** file; fills
+  **Has .env** (`TRUE`/`FALSE`) and copies the file's text into the **.env Content**
+  column. One request per repo; without it those columns show `not scanned`.
+  ⚠️ See the security note below.
+
+> **⚠️ `.env` contents are secrets.** `--check-env` copies committed `.env` files
+> (which usually hold passwords, API keys, and tokens) into `repos.xlsx`, making
+> that file sensitive. Keep it private, never commit or share it, delete it when
+> done, and **rotate any exposed credentials**. `repos.xlsx` is already gitignored.
 
 ### Filling in missing descriptions
 
@@ -93,6 +108,22 @@ Options:
    is `TRUE` — **New Description** already holds a suggested summary. Adjust the
    text if you like, then set **Set Description?** to `set`.
 3. Preview, then apply (see below).
+
+### Updating or removing a committed `.env`
+
+Run `export --check-env` first so **.env Content** / **New .env Content** are
+populated. Then, per row:
+
+- To **change** it: edit **New .env Content** and set **.env Action** to `update`.
+- To **remove** it: set **.env Action** to `delete`.
+
+Preview, then `apply --yes`.
+
+> **⚠️ This writes to your repos.** `update` commits the `.env` to the default
+> branch, so its contents (often secrets) enter git history **permanently**.
+> `delete` removes the file from the current tip but **not from history**. Either
+> way, **rotate any exposed credentials**. Editing secret files in Excel is
+> error-prone — double-check the preview before applying.
 
 ### Apply
 
@@ -113,8 +144,13 @@ Reads your edits, re-checks GitHub, and prints a summary of what will change.
   `--allow-mass-delete`.
 - Setting a description is non-destructive and reversible, so it needs no extra
   confirmation beyond `--yes`.
-- Visibility/description changes on archived repos are skipped with a notice.
-- Every `apply --yes` writes a timestamped `repo_manager_<date>.log`.
+- Visibility/description/`.env` changes on archived repos are skipped with a notice.
+- Every `apply --yes` writes a timestamped `repo_manager_<date>.log` (repo names and
+  statuses only — never `.env` contents).
+- `--check-env` exports `.env` **contents** (often secrets) into the spreadsheet —
+  treat `repos.xlsx` as sensitive (see the warning under Export).
+- `.env Action = update` commits secrets into git history, and `delete` does **not**
+  purge history — rotate any exposed credentials regardless.
 
 ## Troubleshooting
 
@@ -127,6 +163,7 @@ Reads your edits, re-checks GitHub, and prints a summary of what will change.
 | Accents look wrong **in the terminal** | Display-only; the `.xlsx` and GitHub get correct UTF-8. On Windows use Windows Terminal or run `chcp 65001`. |
 | Visibility change refused | The repo is archived (unarchive it first) or blocked by an org policy. |
 | A suggested description is poor | It's a heuristic (first real paragraph of the README) — just edit the cell before applying. |
+| Many repos show `Has .env = TRUE` | You've committed `.env` files — review the **.env Content** column and remove/rotate the exposed secrets. |
 
 ## Limitations & notes
 
@@ -136,11 +173,13 @@ Reads your edits, re-checks GitHub, and prints a summary of what will change.
 - Lists up to **4000 repos** per owner.
 - README summaries are a **heuristic**, not AI — review them before applying.
 - Deleting a repo on GitHub is **irreversible**; use the delete feature carefully.
+- The `.env` features target the **root `.env`** only (not `.env.local`, `.env.*`,
+  or nested paths); `update`/`delete` commit to the repo's **default branch**.
 
 ## Command reference
 
 ```
-export [file] [--owner NAME] [--descriptions]
+export [file] [--owner NAME] [--descriptions] [--check-env]
 apply  [file] [--yes] [--allow-mass-delete] [--force]
 ```
 `file` defaults to `repos.xlsx`.

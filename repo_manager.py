@@ -4,7 +4,8 @@
 Two commands:
   export  -  pull your repos into an editable .xlsx (dropdowns for New Visibility /
              Action / Set Description?). Add --descriptions to scan READMEs and
-             suggest a description for repos that don't have one.
+             suggest descriptions; add --check-env to detect and export committed
+             root .env files (their contents may include secrets).
   apply   -  read the edited .xlsx and apply changes (preview by default; --yes to execute)
 
 All GitHub operations go through the `gh` CLI, so authentication is whatever
@@ -12,6 +13,7 @@ All GitHub operations go through the `gh` CLI, so authentication is whatever
 """
 
 import argparse
+import base64
 import concurrent.futures
 import datetime
 import json
@@ -38,9 +40,11 @@ HEADERS = [
     "Owner", "Repo", "URL", "Current Visibility", "New Visibility", "Action",
     "Has README", "Current Description", "New Description", "Set Description?",
     "Archived", "Fork", "Created", "Last Push", "Size (KB)",
+    "Has .env", ".env Content", "New .env Content", ".env Action",
 ]
 # Cells are read-only (locked) unless their header is in EDITABLE.
-EDITABLE = {"New Visibility", "Action", "New Description", "Set Description?"}
+EDITABLE = {"New Visibility", "Action", "New Description", "Set Description?",
+            "New .env Content", ".env Action"}
 COL = {h: i + 1 for i, h in enumerate(HEADERS)}  # 1-based column index by header
 
 COL_WIDTHS = {
@@ -48,6 +52,7 @@ COL_WIDTHS = {
     "New Visibility": 15, "Action": 9, "Has README": 12,
     "Current Description": 40, "New Description": 45, "Set Description?": 15,
     "Archived": 9, "Fork": 7, "Created": 12, "Last Push": 12, "Size (KB)": 9,
+    "Has .env": 10, ".env Content": 45, "New .env Content": 45, ".env Action": 12,
 }
 
 SNAPSHOT_SHEET = "_snapshot"
@@ -65,12 +70,13 @@ class GhError(Exception):
         super().__init__(f"gh exited {code}: {' '.join(cmd)}\n{(stderr or '').strip()}")
 
 
-def run_gh(args, check=True, timeout=120):
-    """Run `gh <args>` and return the CompletedProcess."""
+def run_gh(args, check=True, timeout=120, input_data=None):
+    """Run `gh <args>` and return the CompletedProcess. `input_data` is sent on stdin."""
     cmd = ["gh"] + args
     try:
         result = subprocess.run(cmd, capture_output=True, text=True,
-                                encoding="utf-8", errors="replace", timeout=timeout)
+                                encoding="utf-8", errors="replace", timeout=timeout,
+                                input=input_data)
     except FileNotFoundError:
         sys.exit("ERROR: GitHub CLI 'gh' not found on PATH.\n"
                  "Install it from https://cli.github.com/ and run 'gh auth login'.")
@@ -113,16 +119,15 @@ _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _EMPHASIS_RE = re.compile(r"[*_`~]+")
 
 
-def fetch_readme(name_with_owner):
-    """Return the README text for a repo, or None if it has no README.
+def _fetch_raw(endpoint, timeout=30):
+    """GET a GitHub endpoint as raw text, or None if it 404s / fails / times out.
 
-    The raw bytes are decoded with a UTF-8 -> Windows-1252 -> Latin-1 fallback so
-    READMEs written in legacy European encodings keep their accents.
+    Bytes are decoded UTF-8 -> Windows-1252 -> Latin-1 so files in legacy European
+    encodings keep their accents (Latin-1 never raises, so decoding always succeeds).
     """
-    cmd = ["gh", "api", f"repos/{name_with_owner}/readme",
-           "-H", "Accept: application/vnd.github.raw"]
+    cmd = ["gh", "api", endpoint, "-H", "Accept: application/vnd.github.raw"]
     try:
-        result = subprocess.run(cmd, capture_output=True, timeout=30)
+        result = subprocess.run(cmd, capture_output=True, timeout=timeout)
     except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
         return None
     if result.returncode != 0:
@@ -133,6 +138,48 @@ def fetch_readme(name_with_owner):
         except UnicodeDecodeError:
             continue
     return result.stdout.decode("latin-1")
+
+
+def fetch_readme(name_with_owner):
+    """Return the README text for a repo, or None if it has no README."""
+    return _fetch_raw(f"repos/{name_with_owner}/readme")
+
+
+def fetch_env(name_with_owner):
+    """Return the repo-root .env text, or None if absent. May contain secrets."""
+    return _fetch_raw(f"repos/{name_with_owner}/contents/.env")
+
+
+def env_sha(name_with_owner):
+    """Return the blob sha of the repo-root .env, or None if it doesn't exist."""
+    r = run_gh(["api", f"repos/{name_with_owner}/contents/.env", "--jq", ".sha"], check=False)
+    sha = r.stdout.strip()
+    return sha if r.returncode == 0 and sha else None
+
+
+def put_env(name_with_owner, content, message):
+    """Create or update the repo-root .env (commits to the default branch).
+
+    The request body is sent on stdin so large content can't blow the command-line
+    length limit.
+    """
+    body = {"message": message,
+            "content": base64.b64encode(content.encode("utf-8")).decode("ascii")}
+    sha = env_sha(name_with_owner)
+    if sha:
+        body["sha"] = sha
+    run_gh(["api", "--method", "PUT", f"repos/{name_with_owner}/contents/.env", "--input", "-"],
+           input_data=json.dumps(body))
+
+
+def delete_env(name_with_owner, message):
+    """Delete the repo-root .env (commits to the default branch). Raises if absent."""
+    sha = env_sha(name_with_owner)
+    if not sha:
+        raise GhError(["gh", "api"], -1, "", "no .env found to delete")
+    body = {"message": message, "sha": sha}
+    run_gh(["api", "--method", "DELETE", f"repos/{name_with_owner}/contents/.env", "--input", "-"],
+           input_data=json.dumps(body))
 
 
 def summarize_readme(text, max_len=DESCRIPTION_MAX):
@@ -177,22 +224,42 @@ def summarize_readme(text, max_len=DESCRIPTION_MAX):
     return ""
 
 
-def scan_readmes(repos, max_workers=8):
-    """Return {nameWithOwner: (has_readme: bool, suggestion: str)} for all repos."""
+ENV_CONTENT_MAX = 30000  # Excel cell limit is 32767 chars; stay safely under
+
+
+def scan_repos(repos, want_readme, want_env, max_workers=8):
+    """Return {nameWithOwner: {has_readme, suggestion, has_env, env_content}}.
+
+    Only the requested checks run; everything else stays at its default. Each
+    repo's checks are isolated so one failure can't abort the whole scan.
+    """
     def work(repo):
         nwo = repo["nameWithOwner"]
-        try:
-            text = fetch_readme(nwo)
-        except Exception:
-            return nwo, (False, "")
-        if text is None:
-            return nwo, (False, "")
-        return nwo, (True, summarize_readme(text))
+        info = {"has_readme": False, "suggestion": "", "has_env": False, "env_content": ""}
+        if want_readme:
+            try:
+                text = fetch_readme(nwo)
+            except Exception:
+                text = None
+            if text is not None:
+                info["has_readme"] = True
+                info["suggestion"] = summarize_readme(text)
+        if want_env:
+            try:
+                content = fetch_env(nwo)
+            except Exception:
+                content = None
+            if content is not None:
+                info["has_env"] = True
+                if len(content) > ENV_CONTENT_MAX:
+                    content = content[:ENV_CONTENT_MAX] + "\n...[truncated]"
+                info["env_content"] = content
+        return nwo, info
 
     result = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-        for nwo, val in ex.map(work, repos):
-            result[nwo] = val
+        for nwo, info in ex.map(work, repos):
+            result[nwo] = info
     return result
 
 
@@ -230,12 +297,23 @@ def cmd_export(args):
     repos.sort(key=lambda r: r["nameWithOwner"].lower())
     print(f"  {len(repos)} repos found.")
 
-    readme_map = {}
-    if args.descriptions:
-        print("Scanning READMEs (one request per repo) ...")
-        readme_map = scan_readmes(repos)
-        have = sum(1 for v in readme_map.values() if v[0])
-        print(f"  {have}/{len(repos)} repos have a README.")
+    scan = {}
+    want_readme = args.descriptions
+    want_env = args.check_env
+    if want_readme or want_env:
+        targets = (["READMEs"] if want_readme else []) + ([".env files"] if want_env else [])
+        print(f"Scanning {' and '.join(targets)} (one request per repo) ...")
+        scan = scan_repos(repos, want_readme, want_env)
+        if want_readme:
+            have = sum(1 for v in scan.values() if v["has_readme"])
+            print(f"  {have}/{len(repos)} repos have a README.")
+        if want_env:
+            have_env = sum(1 for v in scan.values() if v["has_env"])
+            print(f"  {have_env}/{len(repos)} repos have a committed .env in the root.")
+            if have_env:
+                print("  WARNING: .env contents were written to the spreadsheet and may contain\n"
+                      "           secrets. Keep the file private, do not share or commit it, and\n"
+                      "           rotate any exposed credentials.")
 
     wb = Workbook()
     ws = wb.active
@@ -254,14 +332,22 @@ def cmd_export(args):
         nwo = repo["nameWithOwner"]
         current_desc = repo.get("description") or ""
 
-        if args.descriptions:
-            has_readme, suggestion = readme_map.get(nwo, (False, ""))
+        info = scan.get(nwo, {})
+        if want_readme:
+            has_readme = info.get("has_readme", False)
+            suggestion = info.get("suggestion", "")
             has_readme_val = "TRUE" if has_readme else "FALSE"
         else:
-            has_readme, suggestion = False, ""
-            has_readme_val = "not scanned"
+            has_readme, suggestion, has_readme_val = False, "", "not scanned"
 
-        if args.descriptions and has_readme and suggestion and not current_desc:
+        if want_env:
+            has_env_val = "TRUE" if info.get("has_env") else "FALSE"
+            env_content = info.get("env_content", "")
+        else:
+            has_env_val, env_content = "not scanned", ""
+        new_env_content = env_content if want_env else ""
+
+        if want_readme and has_readme and suggestion and not current_desc:
             new_desc = suggestion
         else:
             new_desc = current_desc
@@ -274,6 +360,7 @@ def cmd_export(args):
             "New Visibility": vis,
             "Action": "keep",
             "Has README": has_readme_val,
+            "Has .env": has_env_val,
             "Current Description": current_desc,
             "New Description": new_desc,
             "Set Description?": "keep",
@@ -282,6 +369,9 @@ def cmd_export(args):
             "Created": (repo.get("createdAt") or "")[:10],
             "Last Push": (repo.get("pushedAt") or "")[:10],
             "Size (KB)": repo.get("diskUsage") or 0,
+            ".env Content": env_content,
+            "New .env Content": new_env_content,
+            ".env Action": "keep",
         }
         for head in HEADERS:
             c = _write_cell(ws, row, COL[head], values[head])
@@ -292,6 +382,9 @@ def cmd_export(args):
                 c.fill = LOCKED_FILL
         ws.cell(row=row, column=COL["Current Visibility"]).fill = vis_fill
         ws.cell(row=row, column=COL["New Visibility"]).fill = vis_fill
+        for env_col in (".env Content", "New .env Content"):
+            ws.cell(row=row, column=COL[env_col]).alignment = Alignment(
+                wrap_text=True, vertical="top")
 
     last_row = max(len(repos) + 1, 2)
 
@@ -301,6 +394,9 @@ def cmd_export(args):
                          "Choose 'keep' or 'delete'.", "Set to 'delete' to remove the repo on apply.")
     _add_list_validation(ws, "Set Description?", last_row, "keep,set",
                          "Choose 'keep' or 'set'.", "Set to 'set' to update the description on apply.")
+    _add_list_validation(ws, ".env Action", last_row, "keep,update,delete",
+                         "Choose 'keep', 'update', or 'delete'.",
+                         "'update' commits New .env Content; 'delete' removes the .env file.")
 
     for head in HEADERS:
         ws.column_dimensions[get_column_letter(COL[head])].width = COL_WIDTHS[head]
@@ -326,12 +422,16 @@ def cmd_export(args):
         sys.exit(f"ERROR: could not write {args.file}. "
                  f"If it's open in Excel, close it and run export again.")
     print(f"Wrote {args.file}")
-    print("Next: edit the editable columns (New Visibility / Action / New Description /"
-          " Set Description?), then run:")
+    print("Next: edit the editable (white) columns, then run:")
     print(f"  python repo_manager.py apply {args.file}            # preview")
     print(f"  python repo_manager.py apply {args.file} --yes      # execute")
+    tips = []
     if not args.descriptions:
-        print("Tip: add --descriptions to scan READMEs and suggest descriptions for repos missing one.")
+        tips.append("--descriptions (scan READMEs, suggest descriptions)")
+    if not args.check_env:
+        tips.append("--check-env (detect + export committed .env files)")
+    if tips:
+        print("Tip: add " + " or ".join(tips) + ".")
 
 
 # --- apply ------------------------------------------------------------------
@@ -379,6 +479,9 @@ def read_rows(path):
             "current_description": str(_cell(get(r, "Current Description"))).strip(),
             "new_description": str(_cell(get(r, "New Description"))).strip(),
             "set_description": (str(_cell(get(r, "Set Description?"))).strip().lower() or "keep"),
+            "current_env_content": str(_cell(get(r, ".env Content"))),
+            "new_env_content": str(_cell(get(r, "New .env Content"))),
+            "env_action": (str(_cell(get(r, ".env Action"))).strip().lower() or "keep"),
         })
 
     snapshot = {}
@@ -392,29 +495,54 @@ def read_rows(path):
     return rows, snapshot
 
 
+def _add_once(lst, item):
+    if item not in lst:
+        lst.append(item)
+
+
+# Change types that actually touch GitHub, in execution order.
+ACTIONABLE_KEYS = ("visibility", "descriptions", "env_updates", "env_deletes", "deletes")
+
+
 def compute_changes(rows):
-    vis_changes, deletes, skipped_archived, desc_changes = [], [], [], []
+    """Group requested actions into a dict of row-lists keyed by change type."""
+    changes = {k: [] for k in ACTIONABLE_KEYS}
+    changes["skipped_archived"] = []
     for row in rows:
         if row["action"] == "delete":
-            deletes.append(row)
+            changes["deletes"].append(row)
             continue
+        archived = row["archived"]
 
         nv = row["new_visibility"]
         if nv and nv != row["current_visibility"] and nv in ("public", "private"):
-            if row["archived"]:
-                skipped_archived.append(row)
+            if archived:
+                _add_once(changes["skipped_archived"], row)
             else:
-                vis_changes.append(row)
+                changes["visibility"].append(row)
 
         if row["set_description"] == "set":
             nd = row["new_description"]
             if nd and nd != row["current_description"]:
-                if row["archived"]:
-                    if row not in skipped_archived:
-                        skipped_archived.append(row)
+                if archived:
+                    _add_once(changes["skipped_archived"], row)
                 else:
-                    desc_changes.append(row)
-    return vis_changes, deletes, skipped_archived, desc_changes
+                    changes["descriptions"].append(row)
+
+        env_action = row["env_action"]
+        if env_action == "update":
+            new_env = row["new_env_content"]
+            if new_env.strip() and new_env != row["current_env_content"]:
+                if archived:
+                    _add_once(changes["skipped_archived"], row)
+                else:
+                    changes["env_updates"].append(row)
+        elif env_action == "delete":
+            if archived:
+                _add_once(changes["skipped_archived"], row)
+            else:
+                changes["env_deletes"].append(row)
+    return changes
 
 
 def fetch_live_map(owners):
@@ -428,25 +556,39 @@ def fetch_live_map(owners):
     return live
 
 
-def print_summary(vis_changes, deletes, skipped_archived, desc_changes, warnings):
+def print_summary(changes, warnings):
     print("\n=== Planned changes ===")
-    to_priv = [r for r in vis_changes if r["new_visibility"] == "private"]
-    to_pub = [r for r in vis_changes if r["new_visibility"] == "public"]
+    vis = changes["visibility"]
+    to_priv = [r for r in vis if r["new_visibility"] == "private"]
+    to_pub = [r for r in vis if r["new_visibility"] == "public"]
     print(f"Visibility: {len(to_priv)} public->private, {len(to_pub)} private->public")
-    for r in vis_changes:
+    for r in vis:
         print(f"  ~ {r['nameWithOwner']}: {r['current_visibility']} -> {r['new_visibility']}")
-    print(f"Descriptions to set: {len(desc_changes)}")
-    for r in desc_changes:
+
+    print(f"Descriptions to set: {len(changes['descriptions'])}")
+    for r in changes["descriptions"]:
         preview = r["new_description"]
         if len(preview) > 60:
             preview = preview[:60] + "..."
         print(f"  = {r['nameWithOwner']}: \"{preview}\"")
-    print(f"Delete: {len(deletes)}")
-    for r in deletes:
+
+    # Never print .env contents (they are secrets) - only sizes.
+    n_env_updates = len(changes["env_updates"])
+    note = "  (commits .env contents into git)" if n_env_updates else ""
+    print(f".env updates: {n_env_updates}{note}")
+    for r in changes["env_updates"]:
+        print(f"  e {r['nameWithOwner']}  ({len(r['new_env_content'])} chars)")
+    print(f".env deletions: {len(changes['env_deletes'])}")
+    for r in changes["env_deletes"]:
+        print(f"  x {r['nameWithOwner']}")
+
+    print(f"Delete repo: {len(changes['deletes'])}")
+    for r in changes["deletes"]:
         print(f"  - {r['nameWithOwner']}")
-    if skipped_archived:
-        print(f"Skipped (archived, can't edit): {len(skipped_archived)}")
-        for r in skipped_archived:
+
+    if changes["skipped_archived"]:
+        print(f"Skipped (archived, can't edit): {len(changes['skipped_archived'])}")
+        for r in changes["skipped_archived"]:
             print(f"  . {r['nameWithOwner']}")
     if warnings:
         print("Warnings:")
@@ -467,7 +609,7 @@ def write_log(lines, ok, fail):
 def cmd_apply(args):
     ensure_auth()
     rows, _snapshot = read_rows(args.file)
-    vis_changes, deletes, skipped_archived, desc_changes = compute_changes(rows)
+    changes = compute_changes(rows)
 
     owners = sorted({r["owner"] for r in rows if r["owner"]})
     print(f"Checking live state on GitHub for: {', '.join(owners) or '(none)'} ...")
@@ -478,8 +620,12 @@ def cmd_apply(args):
         if r["set_description"] == "set" and not r["new_description"]:
             warnings.append(f"{r['nameWithOwner']}: 'Set Description?' is 'set' but "
                             f"New Description is empty - skipped")
+        if r["env_action"] == "update" and not r["new_env_content"].strip():
+            warnings.append(f"{r['nameWithOwner']}: '.env Action' is 'update' but "
+                            f"New .env Content is empty - skipped")
 
-    for r in vis_changes + deletes + desc_changes:
+    actionable = [r for k in ACTIONABLE_KEYS for r in changes[k]]
+    for r in actionable:
         nwo = r["nameWithOwner"]
         if nwo not in live:
             warnings.append(f"{nwo}: not found on GitHub (already deleted/renamed) - will skip")
@@ -487,13 +633,13 @@ def cmd_apply(args):
         elif r["current_visibility"] and live[nwo]["visibility"] != r["current_visibility"]:
             warnings.append(f"{nwo}: file says '{r['current_visibility']}' but GitHub says "
                             f"'{live[nwo]['visibility']}' (spreadsheet may be stale)")
-    vis_changes = [r for r in vis_changes if not r.get("_missing")]
-    deletes = [r for r in deletes if not r.get("_missing")]
-    desc_changes = [r for r in desc_changes if not r.get("_missing")]
+    for k in ACTIONABLE_KEYS:
+        changes[k] = [r for r in changes[k] if not r.get("_missing")]
 
-    print_summary(vis_changes, deletes, skipped_archived, desc_changes, warnings)
+    warnings = list(dict.fromkeys(warnings))  # de-dup: a row can be in several lists
+    print_summary(changes, warnings)
 
-    if not vis_changes and not deletes and not desc_changes:
+    if not any(changes[k] for k in ACTIONABLE_KEYS):
         print("\nNothing to do.")
         return
 
@@ -501,13 +647,18 @@ def cmd_apply(args):
         print("\nDRY RUN - no changes made. Re-run with --yes to apply.")
         return
 
-    if len(deletes) > MASS_DELETE_THRESHOLD and not args.allow_mass_delete:
-        sys.exit(f"\nERROR: {len(deletes)} deletions requested (> {MASS_DELETE_THRESHOLD}).\n"
+    if len(changes["deletes"]) > MASS_DELETE_THRESHOLD and not args.allow_mass_delete:
+        sys.exit(f"\nERROR: {len(changes['deletes'])} deletions requested "
+                 f"(> {MASS_DELETE_THRESHOLD}).\n"
                  f"Re-run with --allow-mass-delete if you really mean it.")
 
-    if deletes and not args.force:
+    if changes["env_updates"]:
+        print("\nNOTE: .env updates commit file contents (often secrets) into the repos' "
+              "git history.")
+
+    if changes["deletes"] and not args.force:
         print("\nThe following repos will be PERMANENTLY DELETED:")
-        for r in deletes:
+        for r in changes["deletes"]:
             print(f"  - {r['nameWithOwner']}")
         try:
             answer = input("Type DELETE to confirm (anything else skips deletions): ").strip()
@@ -515,51 +666,66 @@ def cmd_apply(args):
             answer = ""
         if answer != "DELETE":
             print("Deletions cancelled. Other changes (if any) will still proceed.")
-            deletes = []
+            changes["deletes"] = []
 
     log_lines, ok, fail = [], 0, 0
 
-    for r in vis_changes:
+    def record(line, success):
+        nonlocal ok, fail
+        if success:
+            ok += 1
+        else:
+            fail += 1
+        print(line)
+        log_lines.append(line)
+
+    for r in changes["visibility"]:
         nwo, target = r["nameWithOwner"], r["new_visibility"]
         try:
             run_gh(["repo", "edit", nwo, "--visibility", target,
                     "--accept-visibility-change-consequences"])
-            line = f"OK    visibility {r['current_visibility']}->{target}  {nwo}"
-            ok += 1
+            record(f"OK    visibility {r['current_visibility']}->{target}  {nwo}", True)
         except GhError as e:
-            line = f"FAIL  visibility {nwo}: {(e.stderr or '').strip()}"
-            fail += 1
-        print(line)
-        log_lines.append(line)
+            record(f"FAIL  visibility {nwo}: {(e.stderr or '').strip()}", False)
 
-    for r in desc_changes:
+    for r in changes["descriptions"]:
         nwo = r["nameWithOwner"]
         try:
             run_gh(["repo", "edit", nwo, "--description", r["new_description"]])
-            line = f"OK    description set  {nwo}"
-            ok += 1
+            record(f"OK    description set  {nwo}", True)
         except GhError as e:
-            line = f"FAIL  description {nwo}: {(e.stderr or '').strip()}"
-            fail += 1
-        print(line)
-        log_lines.append(line)
+            record(f"FAIL  description {nwo}: {(e.stderr or '').strip()}", False)
 
-    for r in deletes:
+    for r in changes["env_updates"]:
+        nwo = r["nameWithOwner"]
+        try:
+            put_env(nwo, r["new_env_content"], "Update .env (via repo_manager)")
+            record(f"OK    .env updated  {nwo}", True)
+        except GhError as e:
+            record(f"FAIL  .env update {nwo}: {(e.stderr or '').strip()}", False)
+
+    for r in changes["env_deletes"]:
+        nwo = r["nameWithOwner"]
+        try:
+            delete_env(nwo, "Remove .env (via repo_manager)")
+            record(f"OK    .env deleted  {nwo}", True)
+        except GhError as e:
+            record(f"FAIL  .env delete {nwo}: {(e.stderr or '').strip()}", False)
+
+    for r in changes["deletes"]:
         nwo = r["nameWithOwner"]
         try:
             run_gh(["repo", "delete", nwo, "--yes"])
-            line = f"OK    deleted  {nwo}"
-            ok += 1
+            record(f"OK    repo deleted  {nwo}", True)
         except GhError as e:
-            line = f"FAIL  delete {nwo}: {(e.stderr or '').strip()}"
-            fail += 1
-        print(line)
-        log_lines.append(line)
+            record(f"FAIL  repo delete {nwo}: {(e.stderr or '').strip()}", False)
 
     if log_lines:
         write_log(log_lines, ok, fail)
     print(f"\nDone: {ok} succeeded, {fail} failed.")
     print(f"Tip: re-run 'python repo_manager.py export {args.file}' to refresh the spreadsheet.")
+    if fail:
+        sys.exit(1)
 
 
 # --- cli --------------------------------------------------------------------
@@ -583,6 +749,9 @@ def main():
     pe.add_argument("--descriptions", action="store_true",
                     help="Scan READMEs to fill 'Has README' and suggest descriptions "
                          "for repos that don't have one.")
+    pe.add_argument("--check-env", action="store_true",
+                    help="Detect a committed root .env file per repo and export its "
+                         "contents (WARNING: may include secrets) into the spreadsheet.")
     pe.set_defaults(func=cmd_export)
 
     pa = sub.add_parser("apply", help="Apply changes from the Excel file (preview unless --yes).")
