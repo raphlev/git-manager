@@ -21,6 +21,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import zipfile
 
 from openpyxl import Workbook, load_workbook
@@ -37,6 +38,16 @@ MASS_DELETE_THRESHOLD = 3
 DESCRIPTION_MAX = 250  # GitHub allows 350; keep suggestions concise
 CLAUDE_MODEL = os.environ.get("REPO_MANAGER_CLAUDE_MODEL", "claude-haiku-4-5")  # cheap Claude (Haiku)
 OPENAI_MODEL = os.environ.get("REPO_MANAGER_OPENAI_MODEL", "gpt-4o-mini")  # cheap OpenAI option
+
+# USD per 1M tokens (input, output). Used only to estimate --ai cost in the output.
+# Approximate list prices - update if they change, or add your model here.
+AI_PRICING = {
+    "claude-haiku-4-5": (1.0, 5.0),
+    "claude-sonnet-4-6": (3.0, 15.0),
+    "claude-opus-4-8": (5.0, 25.0),
+    "gpt-4o-mini": (0.15, 0.60),
+    "gpt-4o": (2.5, 10.0),
+}
 
 HEADERS = [
     "Owner", "Repo", "URL", "Current Visibility", "New Visibility", "Action",
@@ -257,8 +268,40 @@ _AI_SYSTEM_PROMPT = (
 )
 
 
+class _UsageTracker:
+    """Thread-safe accumulator for AI token usage across the parallel scan."""
+
+    def __init__(self, model):
+        self.model = model
+        self.calls = 0
+        self.input_tokens = 0
+        self.output_tokens = 0
+        self._lock = threading.Lock()
+
+    def add(self, input_tokens, output_tokens):
+        with self._lock:
+            self.calls += 1
+            self.input_tokens += input_tokens or 0
+            self.output_tokens += output_tokens or 0
+
+    def cost(self):
+        """Estimated USD cost, or None if the model's pricing is unknown."""
+        rates = AI_PRICING.get(self.model)
+        if not rates:
+            return None
+        in_rate, out_rate = rates
+        return self.input_tokens / 1e6 * in_rate + self.output_tokens / 1e6 * out_rate
+
+    def summary(self):
+        line = (f"  AI usage ({self.model}): {self.calls} calls, "
+                f"{self.input_tokens:,} input + {self.output_tokens:,} output tokens")
+        cost = self.cost()
+        return line + (f"  (est. ${cost:.4f})" if cost is not None
+                       else "  (cost unknown for this model)")
+
+
 def _make_claude_call():
-    """Return call(text)->str using Claude (cheap model). Validates SDK + key."""
+    """Return call(text)->(text, in_tokens, out_tokens) using Claude. Validates SDK + key."""
     try:
         import anthropic
     except ImportError:
@@ -274,12 +317,13 @@ def _make_claude_call():
             model=CLAUDE_MODEL, max_tokens=200, system=_AI_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": text}],
         )
-        return "".join(b.text for b in resp.content if b.type == "text")
+        out = "".join(b.text for b in resp.content if b.type == "text")
+        return out, resp.usage.input_tokens, resp.usage.output_tokens
     return call
 
 
 def _make_openai_call():
-    """Return call(text)->str using OpenAI (cheap model). Validates SDK + key."""
+    """Return call(text)->(text, in_tokens, out_tokens) using OpenAI. Validates SDK + key."""
     try:
         import openai
     except ImportError:
@@ -296,7 +340,11 @@ def _make_openai_call():
             messages=[{"role": "system", "content": _AI_SYSTEM_PROMPT},
                       {"role": "user", "content": text}],
         )
-        return resp.choices[0].message.content or ""
+        out = resp.choices[0].message.content or ""
+        usage = resp.usage
+        in_tok = usage.prompt_tokens if usage else 0
+        out_tok = usage.completion_tokens if usage else 0
+        return out, in_tok, out_tok
     return call
 
 
@@ -304,22 +352,27 @@ def make_ai_summarizer(provider="claude"):
     """Return summarize(text)->str backed by the chosen AI provider.
 
     Uses the heuristic as a cheap "is this worth summarizing?" pre-check, and
-    falls back to the heuristic on any API error.
+    falls back to the heuristic on any API error. Token usage is accumulated on
+    summarize.usage (a _UsageTracker) so the caller can report cost.
     """
+    model = OPENAI_MODEL if provider == "openai" else CLAUDE_MODEL
     call = _make_openai_call() if provider == "openai" else _make_claude_call()
+    tracker = _UsageTracker(model)
 
     def summarize(text):
         if not summarize_readme(text):       # no real prose -> not worth an API call
             return ""
         try:
-            out = call(text[:6000])
+            out, in_tok, out_tok = call(text[:6000])
         except Exception:
             return summarize_readme(text)    # graceful fallback to the heuristic
+        tracker.add(in_tok, out_tok)
         out = " ".join(out.split()).strip().strip('"').strip()
         if not out or out.upper() == "NONE":
             return ""
         return out[:DESCRIPTION_MAX]
 
+    summarize.usage = tracker
     return summarize
 
 
@@ -421,6 +474,8 @@ def cmd_export(args):
         if want_readme:
             have = sum(1 for v in scan.values() if v["has_readme"])
             print(f"  {have}/{len(repos)} repos have a README.")
+        if ai_enabled and getattr(summarize_fn, "usage", None):
+            print(summarize_fn.usage.summary())
         if want_env:
             have_env = sum(1 for v in scan.values() if v["has_env"])
             print(f"  {have_env}/{len(repos)} repos have a committed .env in the root.")

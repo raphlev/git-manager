@@ -82,10 +82,15 @@ ANTHROPIC_API_KEY=sk-ant-...
 OPENAI_API_KEY=sk-...
 ```
 
-It calls the LLM only for repos that have a README but no description, and skips
-READMEs with no real prose — so it stays cheap. The model replies `NONE` when a
-README isn't descriptive enough (suggestion left blank), and on any API error it
-falls back to the heuristic.
+It calls the LLM for every repo that has a README (so you get a suggestion even
+where a description already exists), but skips READMEs with no real prose. The
+model replies `NONE` when a README isn't descriptive enough (suggestion left
+blank), and on any API error it falls back to the heuristic.
+
+After the scan, the command prints the AI token usage and an estimated cost, e.g.
+`AI usage (claude-haiku-4-5): 51 calls, 120,400 input + 3,100 output tokens
+(est. $0.1359)`. The estimate uses the list prices in `AI_PRICING` in the script
+— update them there if pricing changes or your model isn't listed.
 
 ## Command reference
 
