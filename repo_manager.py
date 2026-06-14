@@ -24,7 +24,7 @@ import sys
 import zipfile
 
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Alignment, Font, PatternFill, Protection
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.exceptions import InvalidFileException
 from openpyxl.worksheet.datavalidation import DataValidation
@@ -35,6 +35,8 @@ JSON_FIELDS = ("name,nameWithOwner,visibility,description,isArchived,isFork,"
                "createdAt,pushedAt,diskUsage,url")
 MASS_DELETE_THRESHOLD = 3
 DESCRIPTION_MAX = 250  # GitHub allows 350; keep suggestions concise
+CLAUDE_MODEL = os.environ.get("REPO_MANAGER_CLAUDE_MODEL", "claude-haiku-4-5")  # cheap Claude (Haiku)
+OPENAI_MODEL = os.environ.get("REPO_MANAGER_OPENAI_MODEL", "gpt-4o-mini")  # cheap OpenAI option
 
 HEADERS = [
     "Owner", "Repo", "URL", "Current Visibility", "New Visibility", "Action",
@@ -117,6 +119,9 @@ _IMG_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")    # ![alt](url)
 _LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]*\)")  # [text](url) -> text
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _EMPHASIS_RE = re.compile(r"[*_`~]+")
+_URL_RE = re.compile(r"https?://\S+")            # bare URLs
+_HR_RE = re.compile(r"^[-*_]{3,}$")              # horizontal rule
+_HTML_LINE_RE = re.compile(r"^<[^>]+>$")         # a line that is only an HTML tag
 
 
 def _fetch_raw(endpoint, timeout=30):
@@ -182,8 +187,29 @@ def delete_env(name_with_owner, message):
            input_data=json.dumps(body))
 
 
+def _clean_md(text):
+    """Strip markdown/HTML noise and bare URLs from a line of prose."""
+    text = _IMG_RE.sub("", text)
+    text = _LINK_RE.sub(r"\1", text)          # [label](url) -> label
+    text = _URL_RE.sub("", text)              # drop bare URLs
+    text = _HTML_TAG_RE.sub("", text)
+    text = _EMPHASIS_RE.sub("", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text.strip("-*•> \t").strip()
+
+
+def _first_sentence(text):
+    """Return the first sentence (up to . ! or ?), else the whole string."""
+    m = re.search(r"[.!?](?:\s|$)", text)
+    return text[:m.start() + 1].strip() if m else text
+
+
 def summarize_readme(text, max_len=DESCRIPTION_MAX):
-    """Heuristically pull a one-line description from README markdown."""
+    """Heuristically pull a concise one-line description from README markdown.
+
+    Skips badges, headings, code, blockquotes, HTML-only lines and horizontal rules,
+    then takes the first substantial prose paragraph and prefers its first sentence.
+    """
     if not text:
         return ""
     paragraphs, current, in_code = [], [], False
@@ -199,12 +225,11 @@ def summarize_readme(text, max_len=DESCRIPTION_MAX):
                 paragraphs.append(" ".join(current))
                 current = []
             continue
-        if line.startswith("#") or line.startswith(">") or line.startswith("<!--"):
+        if (line.startswith("#") or line.startswith(">") or line.startswith("<!--")
+                or _BADGE_RE.match(line) or _HR_RE.match(line) or _HTML_LINE_RE.match(line)):
             if current:
                 paragraphs.append(" ".join(current))
                 current = []
-            continue
-        if _BADGE_RE.match(line):
             continue
         line = re.sub(r"^([-*+]|\d+[.)])\s+", "", line)  # strip leading list marker
         current.append(line)
@@ -212,22 +237,96 @@ def summarize_readme(text, max_len=DESCRIPTION_MAX):
         paragraphs.append(" ".join(current))
 
     for para in paragraphs:
-        p = _IMG_RE.sub("", para)
-        p = _LINK_RE.sub(r"\1", p)
-        p = _HTML_TAG_RE.sub("", p)
-        p = _EMPHASIS_RE.sub("", p)
-        p = re.sub(r"\s+", " ", p).strip()
-        if len(p) >= 20:
-            if len(p) > max_len:
-                p = p[:max_len].rsplit(" ", 1)[0].rstrip(",.;:") + "..."
-            return p
+        cleaned = _clean_md(para)
+        if len(cleaned) < 20:
+            continue
+        sentence = _first_sentence(cleaned)
+        candidate = sentence if len(sentence) >= 40 else cleaned
+        if len(candidate) > max_len:
+            candidate = candidate[:max_len].rsplit(" ", 1)[0].rstrip(",.;:") + "..."
+        return candidate
     return ""
+
+
+_AI_SYSTEM_PROMPT = (
+    "You write the GitHub 'About' description for a repository, given its README. "
+    "Reply with ONE plain-text line of at most 160 characters describing what the "
+    "project is or does: no markdown, no surrounding quotes. If the README does not "
+    "contain enough meaningful information to describe the project, reply with "
+    "exactly: NONE"
+)
+
+
+def _make_claude_call():
+    """Return call(text)->str using Claude (cheap model). Validates SDK + key."""
+    try:
+        import anthropic
+    except ImportError:
+        sys.exit("ERROR: --ai (claude) needs the 'anthropic' package. Install it with:\n"
+                 "  pip install anthropic")
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        sys.exit("ERROR: --ai (claude) needs ANTHROPIC_API_KEY.\n"
+                 "Set it in your environment or in a .env file.")
+    client = anthropic.Anthropic()
+
+    def call(text):
+        resp = client.messages.create(
+            model=CLAUDE_MODEL, max_tokens=200, system=_AI_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": text}],
+        )
+        return "".join(b.text for b in resp.content if b.type == "text")
+    return call
+
+
+def _make_openai_call():
+    """Return call(text)->str using OpenAI (cheap model). Validates SDK + key."""
+    try:
+        import openai
+    except ImportError:
+        sys.exit("ERROR: --ai-provider openai needs the 'openai' package. Install it with:\n"
+                 "  pip install openai")
+    if not os.environ.get("OPENAI_API_KEY"):
+        sys.exit("ERROR: --ai-provider openai needs OPENAI_API_KEY.\n"
+                 "Set it in your environment or in a .env file.")
+    client = openai.OpenAI()
+
+    def call(text):
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL, max_tokens=200,
+            messages=[{"role": "system", "content": _AI_SYSTEM_PROMPT},
+                      {"role": "user", "content": text}],
+        )
+        return resp.choices[0].message.content or ""
+    return call
+
+
+def make_ai_summarizer(provider="claude"):
+    """Return summarize(text)->str backed by the chosen AI provider.
+
+    Uses the heuristic as a cheap "is this worth summarizing?" pre-check, and
+    falls back to the heuristic on any API error.
+    """
+    call = _make_openai_call() if provider == "openai" else _make_claude_call()
+
+    def summarize(text):
+        if not summarize_readme(text):       # no real prose -> not worth an API call
+            return ""
+        try:
+            out = call(text[:6000])
+        except Exception:
+            return summarize_readme(text)    # graceful fallback to the heuristic
+        out = " ".join(out.split()).strip().strip('"').strip()
+        if not out or out.upper() == "NONE":
+            return ""
+        return out[:DESCRIPTION_MAX]
+
+    return summarize
 
 
 ENV_CONTENT_MAX = 30000  # Excel cell limit is 32767 chars; stay safely under
 
 
-def scan_repos(repos, want_readme, want_env, max_workers=8):
+def scan_repos(repos, want_readme, want_env, summarize_fn=summarize_readme, max_workers=8):
     """Return {nameWithOwner: {has_readme, suggestion, has_env, env_content}}.
 
     Only the requested checks run; everything else stays at its default. Each
@@ -243,7 +342,12 @@ def scan_repos(repos, want_readme, want_env, max_workers=8):
                 text = None
             if text is not None:
                 info["has_readme"] = True
-                info["suggestion"] = summarize_readme(text)
+                # Only summarize repos lacking a description (saves AI calls).
+                if not (repo.get("description") or "").strip():
+                    try:
+                        info["suggestion"] = summarize_fn(text)
+                    except Exception:
+                        info["suggestion"] = ""  # never let one repo abort the scan
         if want_env:
             try:
                 content = fetch_env(nwo)
@@ -294,16 +398,24 @@ def cmd_export(args):
     owner = args.owner or get_login()
     print(f"Fetching repos for '{owner}' via gh ...")
     repos = list_repos(owner)
+    # Newest first by creation date; fall back to name when dates are equal/missing.
     repos.sort(key=lambda r: r["nameWithOwner"].lower())
+    repos.sort(key=lambda r: r.get("createdAt") or "", reverse=True)
     print(f"  {len(repos)} repos found.")
 
     scan = {}
-    want_readme = args.descriptions
+    ai_enabled = args.ai or args.ai_provider is not None
+    provider = args.ai_provider or "claude"
+    want_readme = args.descriptions or ai_enabled
     want_env = args.check_env
+    summarize_fn = make_ai_summarizer(provider) if ai_enabled else summarize_readme
     if want_readme or want_env:
         targets = (["READMEs"] if want_readme else []) + ([".env files"] if want_env else [])
+        if ai_enabled:
+            model = OPENAI_MODEL if provider == "openai" else CLAUDE_MODEL
+            targets[0] = f"READMEs (AI via {provider}: {model})"
         print(f"Scanning {' and '.join(targets)} (one request per repo) ...")
-        scan = scan_repos(repos, want_readme, want_env)
+        scan = scan_repos(repos, want_readme, want_env, summarize_fn=summarize_fn)
         if want_readme:
             have = sum(1 for v in scan.values() if v["has_readme"])
             print(f"  {have}/{len(repos)} repos have a README.")
@@ -375,11 +487,8 @@ def cmd_export(args):
         }
         for head in HEADERS:
             c = _write_cell(ws, row, COL[head], values[head])
-            if head in EDITABLE:
-                c.protection = Protection(locked=False)
-            else:
-                c.protection = Protection(locked=True)
-                c.fill = LOCKED_FILL
+            if head not in EDITABLE:
+                c.fill = LOCKED_FILL  # shade reference columns (not protected, just a hint)
         ws.cell(row=row, column=COL["Current Visibility"]).fill = vis_fill
         ws.cell(row=row, column=COL["New Visibility"]).fill = vis_fill
         for env_col in (".env Content", "New .env Content"):
@@ -403,11 +512,6 @@ def cmd_export(args):
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = f"A1:{get_column_letter(len(HEADERS))}{last_row}"
 
-    ws.protection.sheet = True
-    for allow in ("autoFilter", "sort", "formatCells", "formatColumns",
-                  "formatRows", "selectLockedCells", "selectUnlockedCells"):
-        setattr(ws.protection, allow, False)
-
     snap = wb.create_sheet(SNAPSHOT_SHEET)
     snap.append(["nameWithOwner", "visibility", "description"])
     for s_row, repo in enumerate(repos, start=2):
@@ -426,8 +530,8 @@ def cmd_export(args):
     print(f"  python repo_manager.py apply {args.file}            # preview")
     print(f"  python repo_manager.py apply {args.file} --yes      # execute")
     tips = []
-    if not args.descriptions:
-        tips.append("--descriptions (scan READMEs, suggest descriptions)")
+    if not args.descriptions and not ai_enabled:
+        tips.append("--descriptions or --ai (suggest descriptions from READMEs)")
     if not args.check_env:
         tips.append("--check-env (detect + export committed .env files)")
     if tips:
@@ -617,12 +721,20 @@ def cmd_apply(args):
 
     warnings = []
     for r in rows:
+        nwo = r["nameWithOwner"]
+        nv = r["new_visibility"]
+        if nv and nv != r["current_visibility"] and nv not in ("public", "private"):
+            warnings.append(f"{nwo}: New Visibility '{nv}' is not 'public'/'private' - ignored")
+        if r["action"] not in ("keep", "delete"):
+            warnings.append(f"{nwo}: Action '{r['action']}' unrecognized - treated as 'keep'")
+        if r["set_description"] not in ("keep", "set"):
+            warnings.append(f"{nwo}: Set Description? '{r['set_description']}' unrecognized - treated as 'keep'")
+        if r["env_action"] not in ("keep", "update", "delete"):
+            warnings.append(f"{nwo}: .env Action '{r['env_action']}' unrecognized - treated as 'keep'")
         if r["set_description"] == "set" and not r["new_description"]:
-            warnings.append(f"{r['nameWithOwner']}: 'Set Description?' is 'set' but "
-                            f"New Description is empty - skipped")
+            warnings.append(f"{nwo}: 'Set Description?' is 'set' but New Description is empty - skipped")
         if r["env_action"] == "update" and not r["new_env_content"].strip():
-            warnings.append(f"{r['nameWithOwner']}: '.env Action' is 'update' but "
-                            f"New .env Content is empty - skipped")
+            warnings.append(f"{nwo}: '.env Action' is 'update' but New .env Content is empty - skipped")
 
     actionable = [r for k in ACTIONABLE_KEYS for r in changes[k]]
     for r in actionable:
@@ -730,6 +842,29 @@ def cmd_apply(args):
 
 # --- cli --------------------------------------------------------------------
 
+def load_dotenv(path=".env"):
+    """Load KEY=VALUE pairs from a local .env into os.environ (without overriding).
+
+    Lets you keep ANTHROPIC_API_KEY / OPENAI_API_KEY in a gitignored .env file.
+    """
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                if line.startswith("export "):
+                    line = line[len("export "):]
+                key, _, val = line.partition("=")
+                key = key.strip()
+                if key and key not in os.environ:
+                    os.environ[key] = val.strip().strip('"').strip("'")
+    except OSError:
+        pass
+
+
 def main():
     # Never crash just because a description has an emoji/CJK char the console
     # can't encode; degrade to a replacement char instead.
@@ -738,6 +873,8 @@ def main():
             stream.reconfigure(encoding="utf-8", errors="replace")
         except (AttributeError, ValueError):
             pass
+
+    load_dotenv()  # pick up ANTHROPIC_API_KEY / OPENAI_API_KEY from a local .env
 
     parser = argparse.ArgumentParser(
         description="Manage GitHub repos from an Excel file (export / apply).")
@@ -748,7 +885,13 @@ def main():
     pe.add_argument("--owner", help="GitHub owner (default: your authenticated login).")
     pe.add_argument("--descriptions", action="store_true",
                     help="Scan READMEs to fill 'Has README' and suggest descriptions "
-                         "for repos that don't have one.")
+                         "(built-in heuristic) for repos that don't have one.")
+    pe.add_argument("--ai", action="store_true",
+                    help="Use an LLM instead of the heuristic to write descriptions "
+                         "(implies a README scan).")
+    pe.add_argument("--ai-provider", choices=["claude", "openai"], default=None,
+                    help="LLM provider for --ai (default: claude). Keys come from the "
+                         "environment or a .env file (ANTHROPIC_API_KEY / OPENAI_API_KEY).")
     pe.add_argument("--check-env", action="store_true",
                     help="Detect a committed root .env file per repo and export its "
                          "contents (WARNING: may include secrets) into the spreadsheet.")

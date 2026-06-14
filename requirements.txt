@@ -1,1 +1,9 @@
+# Core (required)
 openpyxl>=3.1
+
+# AI descriptions (optional) — only needed for `export --ai`.
+# Install just the provider you use:
+#   claude  -> anthropic  (needs ANTHROPIC_API_KEY)
+#   openai  -> openai     (needs OPENAI_API_KEY)
+anthropic>=0.40
+openai>=1.0
