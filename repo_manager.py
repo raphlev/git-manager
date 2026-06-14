@@ -342,12 +342,14 @@ def scan_repos(repos, want_readme, want_env, summarize_fn=summarize_readme, max_
                 text = None
             if text is not None:
                 info["has_readme"] = True
-                # Only summarize repos lacking a description (saves AI calls).
-                if not (repo.get("description") or "").strip():
-                    try:
-                        info["suggestion"] = summarize_fn(text)
-                    except Exception:
-                        info["suggestion"] = ""  # never let one repo abort the scan
+                # Suggest a description for EVERY repo that has a README, even if it
+                # already has one. To skip repos that already have a description
+                # (e.g. to save AI calls / cost), wrap the block below in:
+                #     if not (repo.get("description") or "").strip():
+                try:
+                    info["suggestion"] = summarize_fn(text)
+                except Exception:
+                    info["suggestion"] = ""  # never let one repo abort the scan
         if want_env:
             try:
                 content = fetch_env(nwo)
@@ -459,7 +461,10 @@ def cmd_export(args):
             has_env_val, env_content = "not scanned", ""
         new_env_content = env_content if want_env else ""
 
-        if want_readme and has_readme and suggestion and not current_desc:
+        # Pre-fill New Description with the suggestion whenever we have one, even if
+        # the repo already has a description (so you can review/replace it). To only
+        # pre-fill for repos WITHOUT a description, add `and not current_desc` below.
+        if want_readme and has_readme and suggestion:
             new_desc = suggestion
         else:
             new_desc = current_desc

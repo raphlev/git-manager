@@ -98,15 +98,23 @@ apply  [file] [--yes] [--allow-mass-delete] [--force]
 ### Export examples
 
 ```
-python repo_manager.py export                                   # -> repos.xlsx (fast, no scans)
+# Basic (no scanning — fast)
+python repo_manager.py export                                   # -> repos.xlsx
 python repo_manager.py export mine.xlsx                         # custom output name
 python repo_manager.py export repos.xlsx --owner some-org       # a different account/org
-python repo_manager.py export repos.xlsx --descriptions         # heuristic README summaries
-python repo_manager.py export repos.xlsx --ai                   # LLM summaries (Claude, default)
-python repo_manager.py export repos.xlsx --ai --ai-provider claude
-python repo_manager.py export repos.xlsx --ai --ai-provider openai
-python repo_manager.py export repos.xlsx --check-env            # export committed root .env files
-python repo_manager.py export repos.xlsx --ai --check-env       # combine scans
+
+# Description suggestions  (pick ONE style; this is the only group --ai/--ai-provider belong to)
+python repo_manager.py export repos.xlsx --descriptions         # heuristic summaries (no AI, no key)
+python repo_manager.py export repos.xlsx --ai                   # LLM summaries (Claude by default)
+python repo_manager.py export repos.xlsx --ai --ai-provider openai   # LLM summaries via OpenAI
+# Note: --ai-provider only has meaning with --ai; --descriptions is the non-AI alternative.
+
+# .env audit  (independent of descriptions)
+python repo_manager.py export repos.xlsx --check-env            # detect + export committed root .env
+
+# Combine the two independent passes in one export (either description style works)
+python repo_manager.py export repos.xlsx --descriptions --check-env   # heuristic descriptions + .env audit
+python repo_manager.py export repos.xlsx --ai --check-env             # LLM descriptions + .env audit
 ```
 
 ### Apply examples
